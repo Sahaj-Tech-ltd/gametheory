@@ -6,9 +6,11 @@ import { initMilGameState, runMilRound } from './milGameEngine.ts'
 import { THREAT_LOCK } from './milTypes.ts'
 import type { MilGameState, MilAction } from './milTypes.ts'
 import { geoAgents } from './geoAgents.ts'
+import { ww1Agents } from './ww1Agents.ts'
+import { ww2Agents } from './ww2Agents.ts'
+import { meAgents } from './meAgents.ts'
 import { initGeoGameState, runGeoRound, SCENARIOS } from './geoGameEngine.ts'
-import type { GeoGameState, ScenarioId } from './geoTypes.ts'
-import { MODEL_OPTIONS, setModel, getModel, type ModelId } from './llmProvider.ts'
+import type { GeoGameState, ScenarioId, GeoAgentInit } from './geoTypes.ts'
 
 type Screen = 'menu' | 'game' | 'wargames' | 'geopolitics'
 type Mode = 'play' | 'fast' | null
@@ -657,7 +659,17 @@ function GeoScreen({ onBack }: { onBack: () => void }) {
   }, [gameState?.log.length])
 
   const startGame = (id: ScenarioId) => {
-    const gs = initGeoGameState(geoAgents, id)
+    const SCENARIO_AGENTS: Record<ScenarioId, GeoAgentInit[]> = {
+      'free-play': geoAgents,
+      'covid-cascade': geoAgents,
+      'china-taiwan': geoAgents,
+      'water-wars': geoAgents,
+      'oil-wars': geoAgents,
+      'middle-east-escalation': meAgents,
+      'ww1': ww1Agents,
+      'ww2': ww2Agents,
+    }
+    const gs = initGeoGameState(SCENARIO_AGENTS[id], id)
     setGameState(gs)
     setScenario(id)
     setMode(null)
