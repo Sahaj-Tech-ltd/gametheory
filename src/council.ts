@@ -17,6 +17,63 @@ import type { ModelId } from './llmProvider.ts'
 const SUB_AGENT_MODEL: ModelId = 'glm-4.7-flashx'
 const LEADER_MODEL: ModelId = 'glm-4.6'
 
+// Wraps llmCall so that any failure (401, rate-limit, network) returns a fallback
+// response string instead of throwing. This keeps a round playable when one or two
+// LLM calls misbehave — the parsers will produce sensible defaults from the fallback.
+const safeCall = async (opts: Parameters<typeof llmCall>[0], fallback: string): Promise<string> => {
+  try {
+    return await llmCall(opts)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    // Visible in dev console; non-blocking. Don't spam — log first 60 chars only.
+    console.warn(`[council] LLM call failed (${msg.slice(0, 60)}), using fallback.`)
+    return fallback
+  }
+}
+
+const FALLBACK_STRATEGIST = [
+  'GOAL: preserve national power',
+  'PRIORITY: monitor the evolving situation',
+  'RECOMMEND: diplomacy',
+  'TARGET: none',
+  'REASONING: advisor unavailable; defaulting to engagement.',
+].join('\n')
+
+const FALLBACK_ECONOMIST = [
+  'SHORTAGES: none',
+  'SURPLUS: none',
+  'PARTNER: none',
+  'RECOMMEND: diplomacy',
+  'REASONING: economic advisor unavailable.',
+].join('\n')
+
+const FALLBACK_INTEL = [
+  'TOP_THREAT: none',
+  'VULNERABILITIES: none',
+  'RECOMMEND: diplomacy',
+  'TARGET: none',
+  'REASONING: intelligence unavailable.',
+].join('\n')
+
+const FALLBACK_DIPLOMAT_PROPOSE = [
+  'PROPOSAL: NO_PROPOSAL',
+  'REASONING: diplomatic channel unavailable.',
+].join('\n')
+
+const FALLBACK_DIPLOMAT_REPLY = [
+  'DECISION: reject',
+  'COUNTER_OFFER: none',
+  'COUNTER_ASK: none',
+  'COUNTER_QTY: 0',
+  'REASONING: communications down.',
+].join('\n')
+
+const FALLBACK_LEADER = [
+  'ACTION: diplomacy',
+  'TARGET: none',
+  'REASONING: command structure offline; defaulting to engagement.',
+].join('\n')
+
 export type CouncilRole = 'strategist' | 'economist' | 'intel' | 'diplomat'
 
 export interface StrategistBrief {
@@ -173,11 +230,11 @@ ALLIANCES: ${agent.alliances.join(', ') || 'none'}
 Provide your strategic brief.
 `.trim()
 
-  const text = await llmCall({
+  const text = await safeCall({
     systemPrompt: `You serve as the strategic advisor to ${agent.name}.\n${agent.personality}\n\n${STRATEGIST_RULES}`,
     userPrompt,
     model: SUB_AGENT_MODEL,
-  })
+  }, FALLBACK_STRATEGIST)
 
   return {
     role: 'strategist',
@@ -244,11 +301,11 @@ ${otherFlows}
 Provide your economic brief.
 `.trim()
 
-  const text = await llmCall({
+  const text = await safeCall({
     systemPrompt: `You serve as the chief economic advisor to ${agent.name}.\n\n${ECONOMIST_RULES}`,
     userPrompt,
     model: SUB_AGENT_MODEL,
-  })
+  }, FALLBACK_ECONOMIST)
 
   return {
     role: 'economist',
@@ -319,11 +376,11 @@ ${militaryLines}
 Provide your intelligence brief.
 `.trim()
 
-  const text = await llmCall({
+  const text = await safeCall({
     systemPrompt: `You serve as the intelligence chief to ${agent.name}.\n\n${INTEL_RULES}`,
     userPrompt,
     model: SUB_AGENT_MODEL,
-  })
+  }, FALLBACK_INTEL)
 
   return {
     role: 'intel',
@@ -392,11 +449,11 @@ ${othersSummary}
 What deal do you propose?
 `.trim()
 
-  const text = await llmCall({
+  const text = await safeCall({
     systemPrompt: `You serve as the chief diplomat of ${agent.name}.\n\n${DIPLOMAT_PROPOSE_RULES}`,
     userPrompt,
     model: SUB_AGENT_MODEL,
-  })
+  }, FALLBACK_DIPLOMAT_PROPOSE)
 
   const proposalField = parseField(text, 'PROPOSAL').toLowerCase()
   if (!proposalField || proposalField === 'no_proposal' || proposalField === 'none') return null
@@ -473,11 +530,11 @@ INCOMING PROPOSAL FROM ${proposer.name} (${proposer.id}):
 Reply.
 `.trim()
 
-  const text = await llmCall({
+  const text = await safeCall({
     systemPrompt: `You serve as the chief diplomat of ${agent.name}.\n\n${DIPLOMAT_REPLY_RULES}`,
     userPrompt,
     model: SUB_AGENT_MODEL,
-  })
+  }, FALLBACK_DIPLOMAT_REPLY)
 
   const decisionRaw = parseField(text, 'DECISION').toLowerCase()
   const decision: DiplomatReply['decision'] =
@@ -591,11 +648,11 @@ ${state.agents.filter(a => a.id !== agent.id).map(a => `- ${a.id}: ${a.name} (ec
 Make your decision.
 `.trim()
 
-  const text = await llmCall({
+  const text = await safeCall({
     systemPrompt: agent.systemPrompt + '\n\n' + LEADER_RULES,
     userPrompt,
     model: LEADER_MODEL,
-  })
+  }, FALLBACK_LEADER)
 
   const action = parseAction(text, 'ACTION')
   const target = parseTarget(text, activeIds)

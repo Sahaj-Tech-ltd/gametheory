@@ -830,7 +830,15 @@ function GeoScreen({ onBack }: { onBack: () => void }) {
   const step = async () => {
     if (thinking || !gameStateRef.current) return
     setThinking(true)
-    const next = await runGeoRound(gameStateRef.current, setGameState)
+    let next: GeoGameState
+    try {
+      next = await runGeoRound(gameStateRef.current, setGameState)
+    } catch (err) {
+      console.error('[GeoScreen] runGeoRound threw — aborting round.', err)
+      setThinking(false)
+      setMode(null)
+      return
+    }
     gameStateRef.current = next
     setThinking(false)
     if (next.winner) setMode(null)
