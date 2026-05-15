@@ -1,6 +1,86 @@
-import type { GeoAgent, GeoGameState, GeoLogEntry, GeoAction, WorldEvent, ScenarioConfig, ScenarioId, GeoAgentInit } from './geoTypes.ts'
-import { GEO_ELIM_RESOURCES } from './geoTypes.ts'
+import type { GeoAgent, GeoGameState, GeoLogEntry, GeoAction, WorldEvent, ScenarioConfig, ScenarioId, GeoAgentInit, Commodity, ResourceVector } from './geoTypes.ts'
+import { GEO_ELIM_RESOURCES, ALL_COMMODITIES, stockpileScore, shortagesOf, zeroVector } from './geoTypes.ts'
 import { getGeoAgentDecision } from './geoLlm.ts'
+import { RESOURCE_PROFILES, defaultFlow } from './geoResourceProfiles.ts'
+
+// Which commodities each action category touches, and the magnitude.
+// Negative = the target (or self) loses that much from stockpile.
+// `mode` controls who the change applies to.
+interface CommodityHit {
+  commodity: Commodity
+  amount: number  // negative = loss, positive = gain
+  mode: 'self' | 'target' | 'both'
+}
+
+// Per-action commodity flows applied directly to stockpile.
+// These run in addition to the scalar military/influence/stability deltas in ACTION_EFFECTS.
+const ACTION_COMMODITY_FX: Record<GeoAction, CommodityHit[]> = {
+  diplomacy:        [],
+  sanction:         [{ commodity: 'capital', amount: -4, mode: 'target' }],
+  'military-posture': [{ commodity: 'capital', amount: -2, mode: 'self' }],
+  'cyber-attack':   [],  // resolved dynamically — success steals capital, failure is no-op
+  'proxy-war':      [
+    { commodity: 'capital', amount: -3, mode: 'self' },
+    { commodity: 'manpower', amount: -3, mode: 'target' },
+    { commodity: 'capital', amount: -3, mode: 'target' },
+  ],
+  strike:           [
+    { commodity: 'capital', amount: -4, mode: 'self' },
+    { commodity: 'manpower', amount: -5, mode: 'target' },
+    { commodity: 'capital', amount: -5, mode: 'target' },
+  ],
+  deploy:           [{ commodity: 'capital', amount: -3, mode: 'self' }],
+  'trade-deal':     [],  // resolved dynamically — exchange surplus commodities
+  aid:              [],  // resolved dynamically — donor's biggest surplus → recipient's biggest shortage
+  propaganda:       [],
+}
+
+// Map event types to the commodities they hit, with weights summing to 1.
+// Event.resourceImpact gets distributed across these commodities.
+const EVENT_COMMODITY_WEIGHTS: Record<string, Partial<ResourceVector>> = {
+  'pandemic':        { manpower: 0.4, capital: 0.3, science: 0.15, food: 0.15 },
+  'supply-crisis':   { science: 0.35, rareEarth: 0.3, capital: 0.2, oil: 0.15 },
+  'trade-war':       { capital: 0.5, science: 0.2, food: 0.15, oil: 0.15 },
+  'cyber-incident':  { capital: 0.5, science: 0.5 },
+  'natural-disaster':{ water: 0.25, food: 0.25, manpower: 0.25, capital: 0.25 },
+  'revolution':      { capital: 0.4, manpower: 0.3, food: 0.15, oil: 0.15 },
+  'assassination':   { capital: 0.4, manpower: 0.3, science: 0.3 },
+  'election':        { capital: 0.5, science: 0.5 },
+  'treaty':          { capital: 0.4, oil: 0.2, gas: 0.2, food: 0.2 },
+  'embargo':         { oil: 0.35, gas: 0.25, capital: 0.25, food: 0.15 },
+}
+
+const applyCommodityDelta = (stockpile: ResourceVector, commodity: Commodity, delta: number): ResourceVector => ({
+  ...stockpile,
+  [commodity]: stockpile[commodity] + delta,
+})
+
+// Distribute a scalar event impact across commodities according to event type weighting.
+const distributeEventImpact = (stockpile: ResourceVector, eventType: string, impact: number): ResourceVector => {
+  const weights = EVENT_COMMODITY_WEIGHTS[eventType] ?? { capital: 0.5, food: 0.25, manpower: 0.25 }
+  const next = { ...stockpile }
+  for (const [c, w] of Object.entries(weights) as [Commodity, number][]) {
+    next[c] = next[c] + impact * w
+  }
+  return next
+}
+
+// Find the agent's largest surplus and largest deficit. Used for trade and aid resolution.
+const surplusCommodity = (agent: GeoAgent): Commodity => {
+  const net = ALL_COMMODITIES.map(c => ({
+    c,
+    score: agent.flow.stockpile[c] + (agent.flow.production[c] - agent.flow.consumption[c]) * 3,
+  }))
+  return net.sort((a, b) => b.score - a.score)[0].c
+}
+
+const deficitCommodity = (agent: GeoAgent): Commodity => {
+  const net = ALL_COMMODITIES.map(c => ({
+    c,
+    score: agent.flow.stockpile[c] + (agent.flow.production[c] - agent.flow.consumption[c]) * 3,
+  }))
+  return net.sort((a, b) => a.score - b.score)[0].c
+}
 
 const COVID_EVENTS: WorldEvent[] = [
   {
@@ -959,16 +1039,21 @@ export const initGeoGameState = (agents: GeoAgentInit[], scenario: ScenarioId): 
   const config = SCENARIOS[scenario]
   const allIds = agents.map(a => a.id)
   return {
-    agents: agents.map(a => ({
-      ...a,
-      resources: a.resources,
-      military: a.military,
-      influence: a.influence,
-      threatMap: Object.fromEntries(allIds.filter(id => id !== a.id).map(id => [id, a.threatMap[id] ?? 0])),
-      lastAction: null,
-      lastTarget: null,
-      reasoning: '',
-    })),
+    agents: agents.map(a => {
+      const flow = a.flow ?? RESOURCE_PROFILES[a.id] ?? defaultFlow()
+      return {
+        ...a,
+        flow,
+        shortages: shortagesOf(flow.stockpile),
+        resources: stockpileScore(flow.stockpile),
+        military: a.military,
+        influence: a.influence,
+        threatMap: Object.fromEntries(allIds.filter(id => id !== a.id).map(id => [id, a.threatMap[id] ?? 0])),
+        lastAction: null,
+        lastTarget: null,
+        reasoning: '',
+      }
+    }),
     eliminated: [],
     stability: config.stabilityStart,
     round: 1,
@@ -989,9 +1074,13 @@ const applyEvent = (state: GeoGameState, event: WorldEvent): GeoGameState => {
   const newAgents = state.agents.map(agent => {
     if (state.eliminated.includes(agent.id)) return agent
     if (!targets.find(t => t.id === agent.id)) return agent
+    const nextStockpile = distributeEventImpact(agent.flow.stockpile, event.type, event.resourceImpact)
+    const nextFlow = { ...agent.flow, stockpile: nextStockpile }
     return {
       ...agent,
-      resources: agent.resources + event.resourceImpact,
+      flow: nextFlow,
+      shortages: shortagesOf(nextStockpile),
+      resources: stockpileScore(nextStockpile),
       military: Math.max(0, agent.military + event.militaryImpact),
       influence: Math.max(0, agent.influence + event.influenceImpact),
     }
@@ -1074,8 +1163,6 @@ const processEvents = (state: GeoGameState): { state: GeoGameState; newLogs: Geo
 }
 
 const ACTION_EFFECTS: Record<GeoAction, {
-  selfRes?: number
-  targetRes?: number
   selfMil?: number
   targetMil?: number
   selfInf?: number
@@ -1086,15 +1173,119 @@ const ACTION_EFFECTS: Record<GeoAction, {
   threatToObservers?: number
 }> = {
   'diplomacy':      { selfInf: 2, stabDelta: 1, threatToSelf: -1 },
-  'sanction':       { targetRes: -3, selfInf: -1, stabDelta: -1, threatFromTarget: 2 },
+  'sanction':       { selfInf: -1, stabDelta: -1, threatFromTarget: 2 },
   'military-posture': { targetMil: -2, stabDelta: -1, threatToObservers: 1, threatFromTarget: 2 },
   'cyber-attack':   { stabDelta: -1, threatToObservers: 2 },
-  'proxy-war':      { selfRes: -3, targetRes: -4, targetMil: -2, stabDelta: -2, threatToObservers: 2 },
-  'strike':         { selfRes: -3, targetRes: -5, targetMil: -8, stabDelta: -3, threatToObservers: 4, threatFromTarget: 3 },
-  'deploy':         { selfRes: -2, selfInf: 1, stabDelta: 0, threatToObservers: 1 },
-  'trade-deal':     { selfRes: 3, targetRes: 3, stabDelta: 1, threatToSelf: -1, threatFromTarget: -1 },
-  'aid':            { selfRes: -2, targetRes: 4, selfInf: 2, stabDelta: 1, threatToSelf: -2 },
+  'proxy-war':      { targetMil: -2, stabDelta: -2, threatToObservers: 2 },
+  'strike':         { targetMil: -8, stabDelta: -3, threatToObservers: 4, threatFromTarget: 3 },
+  'deploy':         { selfInf: 1, stabDelta: 0, threatToObservers: 1 },
+  'trade-deal':     { stabDelta: 1, threatToSelf: -1, threatFromTarget: -1 },
+  'aid':            { selfInf: 2, stabDelta: 1, threatToSelf: -2 },
   'propaganda':     { selfInf: 2, targetInf: -1, stabDelta: 0, threatFromTarget: 1 },
+}
+
+// Apply per-action commodity hits and dynamic exchanges. Returns the per-agent
+// stockpile delta map plus a human-readable outcome string for the action log.
+const resolveCommodityEffects = (
+  decision: { action: GeoAction; targetId: string | null },
+  selfAgent: GeoAgent,
+  target: GeoAgent | null,
+  stockDelta: Record<string, ResourceVector>,
+): string => {
+  const { action } = decision
+
+  // Apply the static commodity hits from ACTION_COMMODITY_FX.
+  for (const hit of ACTION_COMMODITY_FX[action]) {
+    if (hit.mode === 'self' || hit.mode === 'both') {
+      stockDelta[selfAgent.id] = applyCommodityDelta(stockDelta[selfAgent.id], hit.commodity, hit.amount)
+    }
+    if ((hit.mode === 'target' || hit.mode === 'both') && target) {
+      stockDelta[target.id] = applyCommodityDelta(stockDelta[target.id], hit.commodity, hit.amount)
+    }
+  }
+
+  // Dynamic resolution for actions whose commodity depends on context.
+  switch (action) {
+    case 'cyber-attack':
+      if (target && Math.random() < 0.6) {
+        // Successful exfiltration of capital.
+        stockDelta[target.id] = applyCommodityDelta(stockDelta[target.id], 'capital', -3)
+        stockDelta[selfAgent.id] = applyCommodityDelta(stockDelta[selfAgent.id], 'capital', 3)
+        return `cyber-attack on ${target.name} — SUCCESS (stole 3 capital)`
+      }
+      if (target) return `cyber-attack on ${target.name} — TRACED (threat +3)`
+      return 'cyber-attack without target'
+
+    case 'trade-deal': {
+      if (!target) return 'trade deal without partner'
+      // Each side ships its largest surplus to the other.
+      const selfOffer = surplusCommodity(selfAgent)
+      const targetOffer = surplusCommodity(target)
+      stockDelta[selfAgent.id] = applyCommodityDelta(stockDelta[selfAgent.id], selfOffer, -3)
+      stockDelta[selfAgent.id] = applyCommodityDelta(stockDelta[selfAgent.id], targetOffer, 3)
+      stockDelta[target.id] = applyCommodityDelta(stockDelta[target.id], targetOffer, -3)
+      stockDelta[target.id] = applyCommodityDelta(stockDelta[target.id], selfOffer, 3)
+      return `trade deal with ${target.name} (traded ${selfOffer} ↔ ${targetOffer})`
+    }
+
+    case 'aid': {
+      if (!target) return 'aid without recipient'
+      // Donor sends from its surplus to recipient's biggest deficit.
+      const need = deficitCommodity(target)
+      const give = surplusCommodity(selfAgent)
+      stockDelta[selfAgent.id] = applyCommodityDelta(stockDelta[selfAgent.id], give, -3)
+      // The aid is converted to whatever the recipient needs most.
+      stockDelta[target.id] = applyCommodityDelta(stockDelta[target.id], need, 4)
+      return `aid to ${target.name} (sent ${give}, addressed their ${need} shortage)`
+    }
+
+    case 'strike':
+      if (!target) return 'strike without target'
+      if (target.nuclear && Math.random() < 0.15) {
+        // Nuclear retaliation devastates both stockpiles.
+        for (const c of ALL_COMMODITIES) {
+          stockDelta[selfAgent.id] = applyCommodityDelta(stockDelta[selfAgent.id], c, -selfAgent.flow.stockpile[c] * 0.6)
+          stockDelta[target.id] = applyCommodityDelta(stockDelta[target.id], c, -target.flow.stockpile[c] * 0.6)
+        }
+        return `⚔ STRIKE on ${target.name} — NUCLEAR RETALIATION! Both nations devastated.`
+      }
+      return `struck ${target.name} (commodity hits on capital and manpower)`
+
+    case 'sanction':
+      return target ? `sanctioned ${target.name} (−4 their capital)` : 'sanction without target'
+
+    case 'military-posture':
+      return target ? `postured military against ${target.name} (−2 their military readiness)` : 'military posture without target'
+
+    case 'proxy-war':
+      return target ? `waged proxy war against ${target.name} (−3 their manpower, −3 their capital, −3 your capital)` : 'proxy war without target'
+
+    case 'deploy':
+      return target ? `deployed forces to support ${target.name} (−3 your capital)` : 'deployment without target'
+
+    case 'diplomacy':
+      return `pursued diplomatic engagement${target ? ` with ${target.name}` : ''} (+2 influence)`
+
+    case 'propaganda':
+      return target ? `launched propaganda against ${target.name} (+2 influence, −1 theirs)` : 'propaganda campaign'
+
+    default:
+      return ''
+  }
+}
+
+// Tick production - consumption into stockpile. Called once per round per active nation.
+const tickFlow = (agent: GeoAgent): GeoAgent => {
+  const nextStockpile = { ...zeroVector() }
+  for (const c of ALL_COMMODITIES) {
+    nextStockpile[c] = agent.flow.stockpile[c] + agent.flow.production[c] - agent.flow.consumption[c]
+  }
+  return {
+    ...agent,
+    flow: { ...agent.flow, stockpile: nextStockpile },
+    shortages: shortagesOf(nextStockpile),
+    resources: stockpileScore(nextStockpile),
+  }
 }
 
 export const runGeoRound = async (
@@ -1115,7 +1306,9 @@ export const runGeoRound = async (
     }))
   )
 
-  const resDelta: Record<string, number> = Object.fromEntries(current.agents.map(a => [a.id, 0]))
+  const stockDelta: Record<string, ResourceVector> = Object.fromEntries(
+    current.agents.map(a => [a.id, zeroVector()]),
+  )
   const milDelta: Record<string, number> = Object.fromEntries(current.agents.map(a => [a.id, 0]))
   const infDelta: Record<string, number> = Object.fromEntries(current.agents.map(a => [a.id, 0]))
   const tDelta: Record<string, Record<string, number>> = Object.fromEntries(
@@ -1129,80 +1322,28 @@ export const runGeoRound = async (
 
   for (const { agentId, decision } of rawDecisions) {
     const { action, targetId } = decision
+    const selfAgent = current.agents.find(a => a.id === agentId)!
     const target = targetId ? current.agents.find(a => a.id === targetId) ?? null : null
     const obs = active.filter(a => a.id !== agentId)
     const fx = ACTION_EFFECTS[action]
-    let outcome = ''
 
-    if (fx.selfRes) resDelta[agentId] += fx.selfRes
     if (fx.selfMil) milDelta[agentId] += fx.selfMil
     if (fx.selfInf) infDelta[agentId] += fx.selfInf
     if (fx.stabDelta) stabDelta += fx.stabDelta
 
     if (target) {
-      if (fx.targetRes) resDelta[target.id] += fx.targetRes
       if (fx.targetMil) milDelta[target.id] += fx.targetMil
       if (fx.targetInf) infDelta[target.id] += fx.targetInf
       if (fx.threatFromTarget) tDelta[target.id][agentId] += fx.threatFromTarget
     }
 
-    if (fx.threatToSelf && target) {
-      tDelta[agentId][target.id] += fx.threatToSelf
-    }
-    if (fx.threatToObservers) {
-      obs.forEach(o => { tDelta[o.id][agentId] += fx.threatToObservers! })
-    }
+    if (fx.threatToSelf && target) tDelta[agentId][target.id] += fx.threatToSelf
+    if (fx.threatToObservers) obs.forEach(o => { tDelta[o.id][agentId] += fx.threatToObservers! })
 
-    switch (action) {
-      case 'diplomacy':
-        outcome = `pursued diplomatic engagement${target ? ` with ${target.name}` : ''} (+2 influence, +1 stability)`
-        break
-      case 'sanction':
-        outcome = target ? `sanctioned ${target.name} (−3 their resources, −1 your influence)` : 'sanction attempt failed'
-        break
-      case 'military-posture':
-        outcome = target ? `postured military against ${target.name} (−2 their military readiness, threat +1)` : 'military posture without target'
-        break
-      case 'cyber-attack':
-        if (target && Math.random() < 0.6) {
-          resDelta[agentId] += 2
-          resDelta[target.id] -= 2
-          outcome = `cyber-attack on ${target.name} — SUCCESS (−2 their resources, +2 stolen)`
-        } else if (target) {
-          tDelta[target.id][agentId] += 3
-          outcome = `cyber-attack on ${target.name} — TRACED (your threat +3 with them)`
-        }
-        break
-      case 'proxy-war':
-        outcome = target ? `waged proxy war against ${target.name} (−4 their resources, −2 their military, −3 your resources)` : 'proxy war without target'
-        break
-      case 'strike':
-        if (target) {
-          if (target.nuclear && Math.random() < 0.15) {
-            resDelta[agentId] -= 40
-            milDelta[agentId] -= 40
-            resDelta[target.id] -= 40
-            milDelta[target.id] -= 40
-            stabDelta -= 20
-            outcome = `⚔ STRIKE on ${target.name} — NUCLEAR RETALIATION! Both nations devastated. Stability crashes.`
-          } else {
-            outcome = `struck ${target.name} (−5 their resources, −8 their military, −3 your resources, −3 stability)`
-          }
-        }
-        break
-      case 'deploy':
-        outcome = target ? `deployed forces to support ${target.name} (+2 target resources, −2 your resources)` : 'deployment without target'
-        break
-      case 'trade-deal':
-        outcome = target ? `trade deal with ${target.name} (+3 both resources, −1 mutual threat, +1 stability)` : 'trade deal without partner'
-        break
-      case 'aid':
-        outcome = target ? `provided aid to ${target.name} (+4 their resources, +2 your influence, −2 your resources)` : 'aid without recipient'
-        break
-      case 'propaganda':
-        outcome = target ? `launched propaganda against ${target.name} (+2 your influence, −1 their influence)` : 'propaganda campaign'
-        break
-    }
+    // Nuclear strike has an extra stability hit not encoded in the static table.
+    if (action === 'strike' && target?.nuclear && Math.random() < 0.15) stabDelta -= 20
+
+    const outcome = resolveCommodityEffects(decision, selfAgent, target, stockDelta)
 
     actionLogs.push({
       round: current.round,
@@ -1215,15 +1356,21 @@ export const runGeoRound = async (
   }
 
   let newStability = Math.max(0, Math.min(100, current.stability + stabDelta))
-  const newAgents: GeoAgent[] = current.agents.map(agent => {
+  let newAgents: GeoAgent[] = current.agents.map(agent => {
     const newTM: Record<string, number> = { ...agent.threatMap }
     Object.entries(tDelta[agent.id] ?? {}).forEach(([id, d]) => {
       newTM[id] = Math.max(0, Math.min(10, (newTM[id] ?? 0) + d))
     })
+    // Apply commodity deltas from this round's actions to stockpile.
+    const stocked = { ...agent.flow.stockpile }
+    const ad = stockDelta[agent.id] ?? zeroVector()
+    for (const c of ALL_COMMODITIES) stocked[c] = stocked[c] + ad[c]
     const fd = rawDecisions.find(d => d.agentId === agent.id)
     return {
       ...agent,
-      resources: agent.resources + resDelta[agent.id],
+      flow: { ...agent.flow, stockpile: stocked },
+      shortages: shortagesOf(stocked),
+      resources: stockpileScore(stocked),
       military: Math.max(0, agent.military + milDelta[agent.id]),
       influence: Math.max(0, agent.influence + infDelta[agent.id]),
       threatMap: newTM,
@@ -1233,10 +1380,19 @@ export const runGeoRound = async (
     }
   })
 
+  // Run per-round production - consumption tick on all non-eliminated nations.
+  newAgents = newAgents.map(a => current.eliminated.includes(a.id) ? a : tickFlow(a))
+
+  // Stability extremes hit capital (the most fungible resource).
   if (newStability <= 10) {
-    newAgents.forEach(a => {
-      if (!current.eliminated.includes(a.id)) {
-        a.resources -= 5
+    newAgents = newAgents.map(a => {
+      if (current.eliminated.includes(a.id)) return a
+      const stocked = applyCommodityDelta(a.flow.stockpile, 'capital', -6)
+      return {
+        ...a,
+        flow: { ...a.flow, stockpile: stocked },
+        shortages: shortagesOf(stocked),
+        resources: stockpileScore(stocked),
       }
     })
     newStability = Math.max(10, newStability + 5)
@@ -1245,13 +1401,18 @@ export const runGeoRound = async (
       agentId: '_event_',
       action: 'event',
       targetId: null,
-      outcome: '⚠ GLOBAL CRISIS — stability collapse. All nations −5 resources.',
+      outcome: '⚠ GLOBAL CRISIS — stability collapse. All nations lose capital reserves.',
       stabilityDelta: -5,
     })
   } else if (newStability >= 95) {
-    newAgents.forEach(a => {
-      if (!current.eliminated.includes(a.id)) {
-        a.resources += 3
+    newAgents = newAgents.map(a => {
+      if (current.eliminated.includes(a.id)) return a
+      const stocked = applyCommodityDelta(a.flow.stockpile, 'capital', 4)
+      return {
+        ...a,
+        flow: { ...a.flow, stockpile: stocked },
+        shortages: shortagesOf(stocked),
+        resources: stockpileScore(stocked),
       }
     })
     actionLogs.push({
@@ -1259,7 +1420,7 @@ export const runGeoRound = async (
       agentId: '_event_',
       action: 'event',
       targetId: null,
-      outcome: '☮ GLOBAL PROSPERITY — stability peak. All nations +3 resources.',
+      outcome: '☮ GLOBAL PROSPERITY — stability peak. Capital reserves grow.',
       stabilityDelta: 3,
     })
   }

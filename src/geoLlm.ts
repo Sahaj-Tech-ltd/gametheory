@@ -1,6 +1,27 @@
 import { llmCall } from './llmProvider.ts'
-import type { GeoAgent, GeoAction, GeoGameState } from './geoTypes.ts'
-import { THREAT_ESCALATION } from './geoTypes.ts'
+import type { GeoAgent, GeoAction, GeoGameState, Commodity } from './geoTypes.ts'
+import { THREAT_ESCALATION, ALL_COMMODITIES } from './geoTypes.ts'
+
+const fmtCommodityRow = (label: string, vec: Record<Commodity, number>): string => {
+  const cells = ALL_COMMODITIES.map(c => `${c}:${vec[c].toFixed(0).padStart(3)}`).join('  ')
+  return `  ${label.padEnd(11)} ${cells}`
+}
+
+const formatFlow = (agent: GeoAgent): string => {
+  const net: Record<Commodity, number> = {} as Record<Commodity, number>
+  for (const c of ALL_COMMODITIES) {
+    net[c] = agent.flow.production[c] - agent.flow.consumption[c]
+  }
+  const shortageList = agent.shortages.length > 0
+    ? `\n  ⚠ SHORTAGES: ${agent.shortages.join(', ')} — secure supply through trade or coercion`
+    : ''
+  return [
+    fmtCommodityRow('production', agent.flow.production),
+    fmtCommodityRow('consumption', agent.flow.consumption),
+    fmtCommodityRow('net flow', net),
+    fmtCommodityRow('stockpile', agent.flow.stockpile),
+  ].join('\n') + shortageList
+}
 
 export interface GeoDecision {
   action: GeoAction
@@ -62,9 +83,14 @@ const buildGeoContext = (agent: GeoAgent, state: GeoGameState): string => {
       const status = isElim ? ' [ELIMINATED]' : ''
       const nuclear = a.nuclear ? ' [NUCLEAR]' : ''
       const last = a.lastAction
-        ? `last action: ${a.lastAction.toUpperCase()}${a.lastTarget ? ` on ${state.agents.find(x => x.id === a.lastTarget)?.name ?? a.lastTarget}` : ''}`
+        ? `last: ${a.lastAction.toUpperCase()}${a.lastTarget ? ` on ${state.agents.find(x => x.id === a.lastTarget)?.name ?? a.lastTarget}` : ''}`
         : 'no action yet'
-      return `  ${a.name}${status}${nuclear} | resources: ${a.resources} | military: ${a.military} | influence: ${a.influence} | ${last}`
+      // Surface their largest surplus and largest shortage so the LLM can spot trade opportunities.
+      const netFlow = ALL_COMMODITIES.map(c => ({ c, n: a.flow.production[c] - a.flow.consumption[c] }))
+      const surplus = netFlow.sort((x, y) => y.n - x.n)[0]
+      const deficit = netFlow.sort((x, y) => x.n - y.n)[0]
+      const shortages = a.shortages.length > 0 ? ` ⚠${a.shortages.join('/')}` : ''
+      return `  ${a.name}${status}${nuclear} | econ:${a.resources.toFixed(0)} mil:${a.military} inf:${a.influence} | surplus:${surplus.c}(+${surplus.n}) need:${deficit.c}(${deficit.n})${shortages} | ${last}`
     })
     .join('\n')
 
@@ -74,10 +100,13 @@ const buildGeoContext = (agent: GeoAgent, state: GeoGameState): string => {
 === ROUND ${state.round} / ${state.maxRounds} | GLOBAL STABILITY: ${state.stability}/100 ===
 
 YOUR STATUS:
-  Resources: ${agent.resources}
+  Economic score (weighted stockpile): ${agent.resources.toFixed(0)}
   Military: ${agent.military}
   Influence: ${agent.influence}
   Nuclear: ${agent.nuclear ? 'YES' : 'No'}
+
+YOUR RESOURCE FLOW (per-round commodities):
+${formatFlow(agent)}
 
 YOUR THREAT ASSESSMENTS (how much you distrust each nation):
 ${threatToOthers || '  (none yet)'}
