@@ -131,6 +131,9 @@ export interface GeoLogEntry {
   stabilityDelta: number
 }
 
+import type { CouncilSession } from './council.ts'
+import type { NegotiationRecord } from './negotiation.ts'
+
 export interface GeoGameState {
   agents: GeoAgent[]
   eliminated: string[]
@@ -142,6 +145,10 @@ export interface GeoGameState {
   activeEvents: WorldEvent[]
   completedEvents: string[]
   scenario: ScenarioId
+  // Latest council session per agent id, keyed by agent.id. Populated each round.
+  councilSessions?: Record<string, CouncilSession>
+  // Latest negotiation phase outcome (proposals / replies / accepted deals).
+  lastNegotiation?: NegotiationRecord
 }
 
 export type ScenarioId =

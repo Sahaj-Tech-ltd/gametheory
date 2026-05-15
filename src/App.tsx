@@ -644,11 +644,162 @@ const GEO_ACTION_COLOR: Record<string, string> = {
   'propaganda': '#a78bfa',
 }
 
+function CouncilModal({ agentId, state, onClose }: { agentId: string; state: GeoGameState; onClose: () => void }) {
+  const agent = state.agents.find(a => a.id === agentId)
+  const session = state.councilSessions?.[agentId]
+  if (!agent) return null
+
+  const briefBox = (title: string, color: string, body: React.ReactNode) => (
+    <div style={{
+      background: '#0d1120', border: `1px solid ${color}33`, borderRadius: 8,
+      padding: '10px 12px', marginBottom: 10,
+    }}>
+      <div style={{ color, fontSize: 10, fontWeight: 800, letterSpacing: 1.5, textTransform: 'uppercase', marginBottom: 6 }}>{title}</div>
+      <div style={{ color: '#aab', fontSize: 11, lineHeight: 1.55 }}>{body}</div>
+    </div>
+  )
+
+  const flow = agent.flow
+  const flowRow = (label: string, vec: Record<string, number>) => (
+    <div style={{ display: 'grid', gridTemplateColumns: '80px repeat(8, 1fr)', gap: 4, fontSize: 10, color: '#778' }}>
+      <span style={{ color: '#556' }}>{label}</span>
+      {['oil', 'gas', 'water', 'food', 'rareEarth', 'capital', 'science', 'manpower'].map(c => (
+        <span key={c} style={{ color: vec[c] < 0 ? '#f87171' : '#aab', textAlign: 'right' }}>{vec[c].toFixed(0)}</span>
+      ))}
+    </div>
+  )
+
+  return (
+    <div onClick={onClose} style={{
+      position: 'fixed', inset: 0, zIndex: 200, background: '#000000cc',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: '#0a0d16', border: `1px solid ${agent.color}66`, borderRadius: 14,
+        width: '100%', maxWidth: 720, maxHeight: '88vh', overflowY: 'auto',
+        boxShadow: `0 24px 80px ${agent.color}22`,
+      }}>
+        <div style={{ padding: '14px 18px', borderBottom: '1px solid #151c2a', display: 'flex', justifyContent: 'space-between', alignItems: 'center', position: 'sticky', top: 0, background: '#0a0d16' }}>
+          <div>
+            <div style={{ color: agent.color, fontWeight: 800, fontSize: 16 }}>{agent.name} — Council Session</div>
+            <div style={{ color: '#445', fontSize: 11 }}>Round {session?.round ?? '—'} · {agent.personality}</div>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#556', cursor: 'pointer', fontSize: 22, padding: 0, lineHeight: 1 }}>✕</button>
+        </div>
+
+        <div style={{ padding: '14px 18px' }}>
+          {/* Resource snapshot */}
+          <div style={{ background: '#0d1120', border: '1px solid #151c2a', borderRadius: 8, padding: '10px 12px', marginBottom: 12 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: '#445', letterSpacing: 1.5, textTransform: 'uppercase', marginBottom: 8 }}>Resource Flow</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '80px repeat(8, 1fr)', gap: 4, fontSize: 9, color: '#334', marginBottom: 4 }}>
+              <span></span>
+              {['oil', 'gas', 'water', 'food', 'rare', 'capital', 'science', 'labor'].map(c => (
+                <span key={c} style={{ textAlign: 'right' }}>{c}</span>
+              ))}
+            </div>
+            {flowRow('produce', flow.production)}
+            {flowRow('consume', flow.consumption)}
+            {flowRow('stockpile', flow.stockpile)}
+            {agent.shortages.length > 0 && (
+              <div style={{ color: '#f87171', fontSize: 10, marginTop: 6 }}>
+                ⚠ Shortages: {agent.shortages.join(', ')}
+              </div>
+            )}
+          </div>
+
+          {!session && (
+            <div style={{ color: '#556', fontSize: 12, fontStyle: 'italic', textAlign: 'center', padding: 20 }}>
+              No council session yet. Step the simulation forward.
+            </div>
+          )}
+
+          {session && (
+            <>
+              {briefBox('Strategist (long-term goals)', '#8b5cf6', (
+                <>
+                  <div><strong style={{ color: '#cbd' }}>Goal:</strong> {session.briefs.strategist.longTermGoal}</div>
+                  <div><strong style={{ color: '#cbd' }}>Priority:</strong> {session.briefs.strategist.priority}</div>
+                  <div><strong style={{ color: '#cbd' }}>Recommends:</strong> {session.briefs.strategist.recommendation}{session.briefs.strategist.recommendedTarget ? ` → ${session.briefs.strategist.recommendedTarget}` : ''}</div>
+                  <div style={{ fontStyle: 'italic', marginTop: 4 }}>"{session.briefs.strategist.reasoning}"</div>
+                </>
+              ))}
+
+              {briefBox('Economist (resource math)', '#10b981', (
+                <>
+                  <div><strong style={{ color: '#bdb' }}>Shortages:</strong> {session.briefs.economist.criticalShortages.join(', ') || 'none'}</div>
+                  <div><strong style={{ color: '#bdb' }}>Surplus:</strong> {session.briefs.economist.surplusCommodities.join(', ') || 'none'}</div>
+                  <div><strong style={{ color: '#bdb' }}>Suggested partner:</strong> {session.briefs.economist.tradePartnerSuggestion ?? 'none'}</div>
+                  <div><strong style={{ color: '#bdb' }}>Recommends:</strong> {session.briefs.economist.recommendation}</div>
+                  <div style={{ fontStyle: 'italic', marginTop: 4 }}>"{session.briefs.economist.reasoning}"</div>
+                </>
+              ))}
+
+              {briefBox('Intel (threat assessment)', '#f59e0b', (
+                <>
+                  <div><strong style={{ color: '#dcb' }}>Top threat:</strong> {session.briefs.intel.topThreat ?? 'none'}</div>
+                  <div><strong style={{ color: '#dcb' }}>Their vulnerabilities:</strong> {session.briefs.intel.vulnerabilities.join('; ') || '—'}</div>
+                  <div><strong style={{ color: '#dcb' }}>Recommends:</strong> {session.briefs.intel.recommendation}{session.briefs.intel.recommendedTarget ? ` → ${session.briefs.intel.recommendedTarget}` : ''}</div>
+                  <div style={{ fontStyle: 'italic', marginTop: 4 }}>"{session.briefs.intel.reasoning}"</div>
+                </>
+              ))}
+
+              {(session.proposalsMade.length > 0 || session.proposalsReceived.length > 0) && (
+                briefBox('Diplomat (negotiation)', '#3b82f6', (
+                  <>
+                    {session.proposalsMade.map((p, i) => {
+                      const reply = session.repliesReceived.find(r => r.proposalFrom === agent.id)
+                      return (
+                        <div key={`m${i}`} style={{ marginBottom: 6 }}>
+                          <strong style={{ color: '#bcd' }}>→ Proposed to {p.to}:</strong> {p.qty} {p.offer} ↔ {p.qty} {p.ask} ·{' '}
+                          <span style={{ color: reply?.decision === 'accept' ? '#4ade80' : reply?.decision === 'counter' ? '#facc15' : '#f87171' }}>
+                            {reply?.decision.toUpperCase() ?? 'no reply'}
+                          </span>
+                          {reply && <div style={{ color: '#556', fontStyle: 'italic' }}>their reply: "{reply.reasoning}"</div>}
+                        </div>
+                      )
+                    })}
+                    {session.proposalsReceived.map((p, i) => {
+                      const reply = session.repliesGiven.find(r => r.proposalFrom === p.from)
+                      return (
+                        <div key={`r${i}`} style={{ marginBottom: 6 }}>
+                          <strong style={{ color: '#bcd' }}>← From {p.from}:</strong> {p.qty} {p.offer} ↔ {p.qty} {p.ask} · we{' '}
+                          <span style={{ color: reply?.decision === 'accept' ? '#4ade80' : reply?.decision === 'counter' ? '#facc15' : '#f87171' }}>
+                            {reply?.decision.toUpperCase() ?? '—'}
+                          </span>
+                          {reply && <div style={{ color: '#556', fontStyle: 'italic' }}>our reply: "{reply.reasoning}"</div>}
+                        </div>
+                      )
+                    })}
+                  </>
+                ))
+              )}
+
+              {/* Leader synthesis */}
+              <div style={{
+                background: `linear-gradient(135deg, ${agent.color}11, ${agent.color}22)`,
+                border: `1px solid ${agent.color}66`, borderRadius: 8,
+                padding: '12px 14px',
+              }}>
+                <div style={{ color: agent.color, fontSize: 10, fontWeight: 800, letterSpacing: 1.5, textTransform: 'uppercase', marginBottom: 6 }}>Leader Decision</div>
+                <div style={{ color: '#eef', fontSize: 13, fontWeight: 700, marginBottom: 4 }}>
+                  {session.decision.action.toUpperCase()}{session.decision.targetId ? ` → ${state.agents.find(a => a.id === session.decision.targetId)?.name ?? session.decision.targetId}` : ''}
+                </div>
+                <div style={{ color: '#aab', fontSize: 11, fontStyle: 'italic', lineHeight: 1.5 }}>"{session.decision.reasoning}"</div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function GeoScreen({ onBack }: { onBack: () => void }) {
   const [scenario, setScenario] = useState<ScenarioId | null>(null)
   const [gameState, setGameState] = useState<GeoGameState | null>(null)
   const [thinking, setThinking] = useState(false)
   const [mode, setMode] = useState<Mode>(null)
+  const [councilModal, setCouncilModal] = useState<string | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const modeRef = useRef<Mode>(null)
   const gameStateRef = useRef<GeoGameState | null>(null)
@@ -805,17 +956,21 @@ function GeoScreen({ onBack }: { onBack: () => void }) {
         <div style={{ flex: 5, padding: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10, alignContent: 'start', overflowY: 'auto' }}>
           {gameState.agents.map(agent => {
             const isElim = gameState.eliminated.includes(agent.id)
-            const resHealth = Math.max(0, Math.min(1, (agent.resources + 50) / 150))
+            const resHealth = Math.max(0, Math.min(1, agent.resources / 300))
             const resColor = resHealth > 0.6 ? '#4ade80' : resHealth > 0.3 ? '#facc15' : '#f87171'
+            const hasCouncil = !!gameState.councilSessions?.[agent.id]
             return (
-              <div key={agent.id} style={{
-                background: isElim ? '#0a0d16' : '#111827',
-                border: `1px solid ${isElim ? '#151c2a' : agent.color + '55'}`,
-                borderRadius: 12, padding: 12,
-                opacity: isElim ? 0.38 : 1,
-                boxShadow: isElim ? 'none' : `0 0 20px ${agent.color}11`,
-                transition: 'opacity 0.4s, border-color 0.4s',
-              }}>
+              <div key={agent.id}
+                onClick={() => hasCouncil && setCouncilModal(agent.id)}
+                style={{
+                  background: isElim ? '#0a0d16' : '#111827',
+                  border: `1px solid ${isElim ? '#151c2a' : agent.color + '55'}`,
+                  borderRadius: 12, padding: 12,
+                  opacity: isElim ? 0.38 : 1,
+                  boxShadow: isElim ? 'none' : `0 0 20px ${agent.color}11`,
+                  transition: 'opacity 0.4s, border-color 0.4s',
+                  cursor: hasCouncil ? 'pointer' : 'default',
+                }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <div style={{ width: 7, height: 7, borderRadius: '50%', background: isElim ? '#222' : agent.color, boxShadow: isElim ? 'none' : `0 0 6px ${agent.color}` }} />
@@ -899,6 +1054,10 @@ function GeoScreen({ onBack }: { onBack: () => void }) {
           </div>
         </div>
       </div>
+
+      {councilModal && (
+        <CouncilModal agentId={councilModal} state={gameState} onClose={() => setCouncilModal(null)} />
+      )}
     </div>
   )
 }

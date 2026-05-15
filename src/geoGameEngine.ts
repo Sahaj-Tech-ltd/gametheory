@@ -1,7 +1,9 @@
 import type { GeoAgent, GeoGameState, GeoLogEntry, GeoAction, WorldEvent, ScenarioConfig, ScenarioId, GeoAgentInit, Commodity, ResourceVector } from './geoTypes.ts'
 import { GEO_ELIM_RESOURCES, ALL_COMMODITIES, stockpileScore, shortagesOf, zeroVector } from './geoTypes.ts'
-import { getGeoAgentDecision } from './geoLlm.ts'
 import { RESOURCE_PROFILES, defaultFlow } from './geoResourceProfiles.ts'
+import { runCouncilForAgent } from './council.ts'
+import type { CouncilSession } from './council.ts'
+import { runNegotiationPhase, applyDeals, composeDeltas } from './negotiation.ts'
 
 // Which commodities each action category touches, and the magnitude.
 // Negative = the target (or self) loses that much from stockpile.
@@ -1299,15 +1301,39 @@ export const runGeoRound = async (
 
   const active = current.agents.filter(a => !current.eliminated.includes(a.id))
 
-  const rawDecisions = await Promise.all(
-    active.map(async agent => ({
-      agentId: agent.id,
-      decision: await getGeoAgentDecision(agent, current),
-    }))
-  )
+  // Cicero-style negotiation: every active Diplomat proposes once, targets reply,
+  // accepted proposals (and accepted counters) become Deals that transfer commodities
+  // immediately. See src/negotiation.ts and wiki/Research.md.
+  const negotiation = await runNegotiationPhase(current)
+  const negotiationDelta = applyDeals(current.agents, negotiation.deals)
 
-  const stockDelta: Record<string, ResourceVector> = Object.fromEntries(
-    current.agents.map(a => [a.id, zeroVector()]),
+  // CAMEL/AutoGen-style council: each nation runs Strategist + Economist + Intel
+  // in parallel (Flash model), then the Leader (main model) synthesizes with the
+  // negotiation outcome. See src/council.ts.
+  const sessions = await Promise.all(
+    active.map(async agent => {
+      const proposalsMade = negotiation.proposals.filter(p => p.from === agent.id)
+      const proposalsReceived = negotiation.proposals.filter(p => p.to === agent.id)
+      const repliesGiven = negotiation.replies.filter(r => {
+        const p = negotiation.proposals.find(pp => pp.from === r.proposalFrom)
+        return p?.to === agent.id
+      })
+      const repliesReceived = negotiation.replies.filter(r => r.proposalFrom === agent.id)
+      return runCouncilForAgent(agent, current, proposalsMade, proposalsReceived, repliesGiven, repliesReceived)
+    }),
+  )
+  const councilSessions: Record<string, CouncilSession> = {}
+  for (const s of sessions) councilSessions[s.agentId] = s
+
+  const rawDecisions = sessions.map(s => ({
+    agentId: s.agentId,
+    decision: { action: s.decision.action, targetId: s.decision.targetId, reasoning: s.decision.reasoning },
+  }))
+
+  // Pre-seed stockDelta with negotiation transfers so actions and deals merge into one application.
+  const stockDelta: Record<string, ResourceVector> = composeDeltas(
+    negotiationDelta,
+    Object.fromEntries(current.agents.map(a => [a.id, zeroVector()])),
   )
   const milDelta: Record<string, number> = Object.fromEntries(current.agents.map(a => [a.id, 0]))
   const infDelta: Record<string, number> = Object.fromEntries(current.agents.map(a => [a.id, 0]))
@@ -1319,6 +1345,30 @@ export const runGeoRound = async (
   )
   let stabDelta = 0
   const actionLogs: GeoLogEntry[] = []
+
+  // Log negotiation outcomes so the timeline shows the back-and-forth before actions.
+  for (const proposal of negotiation.proposals) {
+    const targetName = current.agents.find(a => a.id === proposal.to)?.name ?? proposal.to
+    const reply = negotiation.replies.find(r => r.proposalFrom === proposal.from)
+    const verdict = reply?.decision ?? 'no-reply'
+    const verdictGlyph = verdict === 'accept' ? '✓' : verdict === 'counter' ? '⇄' : '✗'
+    actionLogs.push({
+      round: current.round,
+      agentId: proposal.from,
+      action: 'diplomacy',
+      targetId: proposal.to,
+      outcome: `🤝 ${verdictGlyph} proposed ${targetName}: ${proposal.qty} ${proposal.offer} ↔ ${proposal.qty} ${proposal.ask} → ${verdict.toUpperCase()}${reply?.reasoning ? ` ("${reply.reasoning}")` : ''}`,
+      stabilityDelta: verdict === 'accept' ? 1 : 0,
+    })
+    // Cooperation signal: accepted deals reduce mutual threat; rejection nudges it up slightly.
+    if (verdict === 'accept' || verdict === 'counter') {
+      tDelta[proposal.from][proposal.to] = (tDelta[proposal.from][proposal.to] ?? 0) - 1
+      tDelta[proposal.to][proposal.from] = (tDelta[proposal.to][proposal.from] ?? 0) - 1
+      stabDelta += 1
+    } else if (verdict === 'reject') {
+      tDelta[proposal.from][proposal.to] = (tDelta[proposal.from][proposal.to] ?? 0) + 1
+    }
+  }
 
   for (const { agentId, decision } of rawDecisions) {
     const { action, targetId } = decision
@@ -1451,6 +1501,8 @@ export const runGeoRound = async (
     activeEvents: current.activeEvents,
     completedEvents: current.completedEvents,
     scenario: current.scenario,
+    councilSessions,
+    lastNegotiation: negotiation,
   }
 
   onUpdate(next)
